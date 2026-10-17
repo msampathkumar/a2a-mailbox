@@ -117,11 +117,15 @@ func (h *handler) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	for _, p := range req.Message.Parts {
 		if strings.TrimSpace(p.Text) != "" {
 			texts = append(texts, p.Text)
+		} else if strings.TrimSpace(p.Filename) != "" {
+			texts = append(texts, "[file: "+p.Filename+"]")
+		} else if strings.TrimSpace(p.URL) != "" {
+			texts = append(texts, "[url: "+p.URL+"]")
 		}
 	}
 	text := strings.Join(texts, " ")
-	if strings.TrimSpace(text) == "" {
-		writeError(w, http.StatusBadRequest, "message must contain non-empty text")
+	if strings.TrimSpace(text) == "" && len(req.Message.Parts) == 0 {
+		writeError(w, http.StatusBadRequest, "message must contain non-empty parts")
 		return
 	}
 
@@ -130,6 +134,7 @@ func (h *handler) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		TaskID:    req.Message.TaskID,
 		ContextID: req.Message.ContextID,
 		Text:      text,
+		Parts:     req.Message.Parts,
 		Metadata:  req.Metadata,
 	})
 	if err != nil {
@@ -189,21 +194,79 @@ func (h *handler) handleGetTask(w http.ResponseWriter, r *http.Request) {
 
 func (h *handler) handleTaskAction(w http.ResponseWriter, r *http.Request) {
 	idAndAction := strings.TrimSpace(r.PathValue("idAndAction"))
-	taskID, ok := strings.CutSuffix(idAndAction, ":cancel")
-	if !ok || strings.TrimSpace(taskID) == "" {
+	idx := strings.LastIndex(idAndAction, ":")
+	if idx <= 0 {
 		writeError(w, http.StatusBadRequest, "unsupported task action")
 		return
 	}
-	task, err := h.cfg.Backend.CancelTask(r.Context(), taskID)
-	if err != nil {
-		if errors.Is(err, store.ErrTaskNotFound) {
-			writeError(w, http.StatusNotFound, err.Error())
+	taskID := strings.TrimSpace(idAndAction[:idx])
+	action := strings.TrimSpace(idAndAction[idx+1:])
+
+	switch action {
+	case "cancel":
+		task, err := h.cfg.Backend.CancelTask(r.Context(), taskID)
+		if err != nil {
+			if errors.Is(err, store.ErrTaskNotFound) {
+				writeError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+		writeJSON(w, http.StatusOK, task)
+
+	case "claim":
+		body, _ := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+		var payload struct {
+			WorkerID string `json:"workerId"`
+			Text     string `json:"text"`
+		}
+		_ = json.Unmarshal(body, &payload)
+		if strings.TrimSpace(payload.Text) == "" {
+			payload.Text = "Task claimed by responder"
+		}
+		task, err := h.cfg.Backend.RespondTask(r.Context(), store.RespondRequest{
+			TaskID:   taskID,
+			State:    "TASK_STATE_WORKING",
+			WorkerID: payload.WorkerID,
+			Text:     payload.Text,
+		})
+		if err != nil {
+			if errors.Is(err, store.ErrTaskNotFound) {
+				writeError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, task)
+
+	case "reply", "update":
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "failed to read request body")
+			return
+		}
+		var req store.RespondRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON payload: "+err.Error())
+			return
+		}
+		req.TaskID = taskID
+		task, err := h.cfg.Backend.RespondTask(r.Context(), req)
+		if err != nil {
+			if errors.Is(err, store.ErrTaskNotFound) {
+				writeError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, task)
+
+	default:
+		writeError(w, http.StatusBadRequest, "unsupported task action: "+action)
 	}
-	writeJSON(w, http.StatusOK, task)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

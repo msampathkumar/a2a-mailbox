@@ -185,3 +185,117 @@ func TestPubSubBackend_PublishesEventEnvelope(t *testing.T) {
 		t.Fatalf("publishedData = %s, want message text", string(publishedData))
 	}
 }
+
+func TestResponder_Claim_Clarify_FileAttachments_And_Complete(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "mailbox.json")
+	db, err := store.NewDBBackend(dbPath, "TASK_STATE_SUBMITTED")
+	if err != nil {
+		t.Fatalf("NewDBBackend() error = %v", err)
+	}
+
+	// 1. Requester submits initial task
+	t1, err := db.RegisterMessage(context.Background(), store.IncomingMessage{
+		MessageID: "msg-req-1",
+		Text:      "Generate Q3 compliance report",
+	})
+	if err != nil {
+		t.Fatalf("RegisterMessage(1) error = %v", err)
+	}
+	if awaiting, _ := t1.Metadata["awaitingWorker"].(bool); !awaiting {
+		t.Fatalf("expected awaitingWorker=true on new task, got %+v", t1.Metadata)
+	}
+
+	// 2. Responder claims task -> TASK_STATE_WORKING
+	tWorking, err := db.RespondTask(context.Background(), store.RespondRequest{
+		TaskID:   t1.ID,
+		State:    "TASK_STATE_WORKING",
+		WorkerID: "worker-compliance-01",
+		Text:     "Claimed task; scanning Q3 ledger...",
+	})
+	if err != nil {
+		t.Fatalf("RespondTask(working) error = %v", err)
+	}
+	if tWorking.Status.State != "TASK_STATE_WORKING" {
+		t.Fatalf("state = %q, want TASK_STATE_WORKING", tWorking.Status.State)
+	}
+	if gotWorker, _ := tWorking.Metadata["workerId"].(string); gotWorker != "worker-compliance-01" {
+		t.Fatalf("workerId = %q, want worker-compliance-01", gotWorker)
+	}
+
+	// 3. Responder needs additional info from requester -> TASK_STATE_INPUT_REQUIRED + template file attachment
+	templateB64 := base64.StdEncoding.EncodeToString([]byte("region: required\naudit_scope: full\n"))
+	tClarify, err := db.RespondTask(context.Background(), store.RespondRequest{
+		TaskID:   t1.ID,
+		State:    "TASK_STATE_INPUT_REQUIRED",
+		WorkerID: "worker-compliance-01",
+		Text:     "Which region should Q3 cover? Please fill out the attached scope.yaml.",
+		Files: []store.FileAttachment{
+			{
+				Filename:  "scope.yaml",
+				MediaType: "application/x-yaml",
+				Raw:       templateB64,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("RespondTask(input-required) error = %v", err)
+	}
+	if tClarify.Status.State != "TASK_STATE_INPUT_REQUIRED" {
+		t.Fatalf("state = %q, want TASK_STATE_INPUT_REQUIRED", tClarify.Status.State)
+	}
+	if awaiting, _ := tClarify.Metadata["awaitingWorker"].(bool); awaiting {
+		t.Fatalf("expected awaitingWorker=false while waiting for requester input, got %+v", tClarify.Metadata)
+	}
+
+	// 4. Requester replies on the same taskId with text + filled file part
+	filledB64 := base64.StdEncoding.EncodeToString([]byte("region: eu-west-1\naudit_scope: full\n"))
+	tReplied, err := db.RegisterMessage(context.Background(), store.IncomingMessage{
+		MessageID: "msg-req-2",
+		TaskID:    t1.ID,
+		ContextID: t1.ContextID,
+		Text:      "Here is the completed scope.yaml for eu-west-1",
+		Parts: []store.Part{
+			{Text: "Here is the completed scope.yaml for eu-west-1"},
+			{Filename: "scope-filled.yaml", MediaType: "application/x-yaml", Raw: filledB64},
+		},
+	})
+	if err != nil {
+		t.Fatalf("RegisterMessage(2) error = %v", err)
+	}
+	if awaiting, _ := tReplied.Metadata["awaitingWorker"].(bool); !awaiting {
+		t.Fatalf("expected awaitingWorker=true after requester provides requested info, got %+v", tReplied.Metadata)
+	}
+
+	// 5. Responder finishes work and attaches the generated report artifact -> TASK_STATE_COMPLETED
+	reportB64 := base64.StdEncoding.EncodeToString([]byte("# Q3 Compliance Report (eu-west-1)\nStatus: PASS\n"))
+	tDone, err := db.RespondTask(context.Background(), store.RespondRequest{
+		TaskID:   t1.ID,
+		State:    "TASK_STATE_COMPLETED",
+		WorkerID: "worker-compliance-01",
+		Text:     "Q3 compliance audit complete. Report attached.",
+		Files: []store.FileAttachment{
+			{
+				Filename:  "q3-compliance-report.md",
+				MediaType: "text/markdown",
+				Raw:       reportB64,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("RespondTask(completed) error = %v", err)
+	}
+	if tDone.Status.State != "TASK_STATE_COMPLETED" {
+		t.Fatalf("state = %q, want TASK_STATE_COMPLETED", tDone.Status.State)
+	}
+	foundReport := false
+	for _, art := range tDone.Artifacts {
+		if art.Name == "q3-compliance-report.md" && len(art.Parts) > 0 && art.Parts[0].Raw == reportB64 {
+			foundReport = true
+		}
+	}
+	if !foundReport {
+		t.Fatalf("expected q3-compliance-report.md artifact on completed task, got %+v", tDone.Artifacts)
+	}
+}

@@ -137,22 +137,41 @@ func (b *TKBackend) ListTasks(ctx context.Context, contextID, status string) ([]
 	return out, nil
 }
 
-// ReplyTask records a reply on the task and updates the `tk` ticket status/notes.
-func (b *TKBackend) ReplyTask(ctx context.Context, taskID, replyText, newState string) (*Task, error) {
-	task, err := b.db.ReplyTask(ctx, taskID, replyText, newState)
+// RespondTask records a responder update/reply (with optional file attachments) and updates the `tk` ticket status/notes.
+func (b *TKBackend) RespondTask(ctx context.Context, req RespondRequest) (*Task, error) {
+	task, err := b.db.RespondTask(ctx, req)
 	if err != nil {
 		return nil, err
 	}
 	if ticketID, ok := task.Metadata["tkTicketId"].(string); ok && ticketID != "" {
-		_, _ = b.execTK(ctx, "add-note", ticketID, fmt.Sprintf("[A2A Reply] %s", replyText))
+		note := fmt.Sprintf("[A2A Responder (%s)] %s", task.Status.State, req.Text)
+		if len(req.Files) > 0 {
+			var names []string
+			for _, f := range req.Files {
+				names = append(names, f.Filename)
+			}
+			note += fmt.Sprintf(" (attached files: %s)", strings.Join(names, ", "))
+		}
+		_, _ = b.execTK(ctx, "add-note", ticketID, note)
 		switch task.Status.State {
 		case "TASK_STATE_COMPLETED", "TASK_STATE_CANCELED", "TASK_STATE_FAILED", "TASK_STATE_REJECTED":
 			_, _ = b.execTK(ctx, "close", ticketID)
 		case "TASK_STATE_WORKING":
 			_, _ = b.execTK(ctx, "status", ticketID, "in_progress")
+		case "TASK_STATE_INPUT_REQUIRED", "TASK_STATE_AUTH_REQUIRED":
+			_, _ = b.execTK(ctx, "status", ticketID, "open")
 		}
 	}
 	return task, nil
+}
+
+// ReplyTask records a reply on the task and updates the `tk` ticket status/notes.
+func (b *TKBackend) ReplyTask(ctx context.Context, taskID, replyText, newState string) (*Task, error) {
+	return b.RespondTask(ctx, RespondRequest{
+		TaskID: taskID,
+		Text:   replyText,
+		State:  newState,
+	})
 }
 
 // CancelTask cancels the task and closes its `tk` ticket.

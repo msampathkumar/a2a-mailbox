@@ -20,9 +20,31 @@ var ErrTaskNotFound = errors.New("task not found")
 // ErrTaskTerminal indicates a task has already reached a terminal state and cannot accept new turns.
 var ErrTaskTerminal = errors.New("task is in a terminal state and cannot be restarted")
 
-// Part represents a message or artifact content part.
+// Part represents an A2A v1.0 message or artifact content part (text, raw base64 file bytes, URL, or structured data).
 type Part struct {
-	Text string `json:"text,omitempty"`
+	Text      string `json:"text,omitempty"`
+	Raw       string `json:"raw,omitempty"`
+	URL       string `json:"url,omitempty"`
+	MediaType string `json:"mediaType,omitempty"`
+	Filename  string `json:"filename,omitempty"`
+	Data      any    `json:"data,omitempty"`
+}
+
+// FileAttachment represents a file or URL attached by a responder or worker.
+type FileAttachment struct {
+	Filename  string `json:"filename,omitempty"`
+	MediaType string `json:"mediaType,omitempty"`
+	Raw       string `json:"raw,omitempty"`
+	URL       string `json:"url,omitempty"`
+}
+
+// RespondRequest represents an asynchronous worker/responder status update or reply on a task.
+type RespondRequest struct {
+	TaskID   string           `json:"taskId"`
+	Text     string           `json:"text"`
+	State    string           `json:"state"`
+	WorkerID string           `json:"workerId,omitempty"`
+	Files    []FileAttachment `json:"files,omitempty"`
 }
 
 // Message represents an A2A v1.0 Message.
@@ -64,6 +86,7 @@ type IncomingMessage struct {
 	TaskID    string
 	ContextID string
 	Text      string
+	Parts     []Part
 	Metadata  map[string]any
 }
 
@@ -73,6 +96,7 @@ type Backend interface {
 	RegisterMessage(ctx context.Context, msg IncomingMessage) (*Task, error)
 	GetTask(ctx context.Context, taskID string) (*Task, error)
 	ListTasks(ctx context.Context, contextID, status string) ([]*Task, error)
+	RespondTask(ctx context.Context, req RespondRequest) (*Task, error)
 	ReplyTask(ctx context.Context, taskID, replyText, newState string) (*Task, error)
 	CancelTask(ctx context.Context, taskID string) (*Task, error)
 }
@@ -129,6 +153,11 @@ func (db *DBBackend) RegisterMessage(_ context.Context, in IncomingMessage) (*Ta
 		msgID = newID("msg")
 	}
 
+	userParts := in.Parts
+	if len(userParts) == 0 {
+		userParts = []Part{{Text: in.Text}}
+	}
+
 	if strings.TrimSpace(in.TaskID) != "" {
 		for _, t := range tasks {
 			if t.ID == strings.TrimSpace(in.TaskID) {
@@ -140,9 +169,13 @@ func (db *DBBackend) RegisterMessage(_ context.Context, in IncomingMessage) (*Ta
 					TaskID:    t.ID,
 					ContextID: t.ContextID,
 					Role:      "ROLE_USER",
-					Parts:     []Part{{Text: in.Text}},
+					Parts:     userParts,
 				}
 				t.History = append(t.History, userMsg)
+				if t.Metadata == nil {
+					t.Metadata = make(map[string]any)
+				}
+				t.Metadata["awaitingWorker"] = true
 				ackText := fmt.Sprintf("Mailbox recorded follow-up message (#%d) for task %s in context %s", len(t.History), t.ID, t.ContextID)
 				t.Status = TaskStatus{
 					State:     db.ackState,
@@ -175,7 +208,7 @@ func (db *DBBackend) RegisterMessage(_ context.Context, in IncomingMessage) (*Ta
 		TaskID:    taskID,
 		ContextID: ctxID,
 		Role:      "ROLE_USER",
-		Parts:     []Part{{Text: in.Text}},
+		Parts:     userParts,
 	}
 	ackText := fmt.Sprintf("Queued in A2A Mailbox (task=%s, context=%s)", taskID, ctxID)
 	task := &Task{
@@ -199,8 +232,11 @@ func (db *DBBackend) RegisterMessage(_ context.Context, in IncomingMessage) (*Ta
 				Parts:      []Part{{Text: ackText}},
 			},
 		},
-		History:  []Message{userMsg},
-		Metadata: map[string]any{"backend": "db"},
+		History: []Message{userMsg},
+		Metadata: map[string]any{
+			"backend":        "db",
+			"awaitingWorker": true,
+		},
 	}
 	for k, v := range in.Metadata {
 		task.Metadata[k] = v
@@ -302,8 +338,8 @@ func (db *DBBackend) ListTasks(_ context.Context, contextID, status string) ([]*
 	return out, nil
 }
 
-// ReplyTask records an operator/worker reply artifact on a task and updates its state.
-func (db *DBBackend) ReplyTask(_ context.Context, taskID, replyText, newState string) (*Task, error) {
+// RespondTask records an operator/worker status update, clarification request, or completion with optional file attachments.
+func (db *DBBackend) RespondTask(_ context.Context, req RespondRequest) (*Task, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -311,19 +347,35 @@ func (db *DBBackend) ReplyTask(_ context.Context, taskID, replyText, newState st
 	if err != nil {
 		return nil, err
 	}
-	state := NormalizeProtocolState(newState)
+	state := NormalizeProtocolState(req.State)
 	if state == "" {
 		state = "TASK_STATE_COMPLETED"
 	}
 	now := time.Now().UTC()
 	for _, t := range tasks {
-		if t.ID == strings.TrimSpace(taskID) {
+		if t.ID == strings.TrimSpace(req.TaskID) {
+			var parts []Part
+			if strings.TrimSpace(req.Text) != "" {
+				parts = append(parts, Part{Text: req.Text})
+			}
+			for _, f := range req.Files {
+				parts = append(parts, Part{
+					Filename:  f.Filename,
+					MediaType: f.MediaType,
+					Raw:       f.Raw,
+					URL:       f.URL,
+				})
+			}
+			if len(parts) == 0 {
+				parts = []Part{{Text: "Status updated to " + state}}
+			}
+
 			agentMsg := Message{
 				MessageID: newID("reply"),
 				TaskID:    t.ID,
 				ContextID: t.ContextID,
 				Role:      "ROLE_AGENT",
-				Parts:     []Part{{Text: replyText}},
+				Parts:     parts,
 			}
 			t.History = append(t.History, agentMsg)
 			t.Status = TaskStatus{
@@ -331,20 +383,65 @@ func (db *DBBackend) ReplyTask(_ context.Context, taskID, replyText, newState st
 				Timestamp: &now,
 				Message:   &agentMsg,
 			}
-			t.Artifacts = []Artifact{
-				{
+			if t.Metadata == nil {
+				t.Metadata = make(map[string]any)
+			}
+			if strings.TrimSpace(req.WorkerID) != "" {
+				t.Metadata["workerId"] = strings.TrimSpace(req.WorkerID)
+			}
+			switch state {
+			case "TASK_STATE_INPUT_REQUIRED", "TASK_STATE_AUTH_REQUIRED":
+				t.Metadata["awaitingWorker"] = false
+			case "TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED":
+				t.Metadata["awaitingWorker"] = false
+			default:
+				t.Metadata["awaitingWorker"] = true
+			}
+
+			var newArtifacts []Artifact
+			if strings.TrimSpace(req.Text) != "" {
+				newArtifacts = append(newArtifacts, Artifact{
 					ArtifactID: newID("art"),
 					Name:       "mailbox-reply",
-					Parts:      []Part{{Text: replyText}},
-				},
+					Parts:      []Part{{Text: req.Text}},
+				})
 			}
+			for _, f := range req.Files {
+				artName := strings.TrimSpace(f.Filename)
+				if artName == "" {
+					artName = "attachment"
+				}
+				newArtifacts = append(newArtifacts, Artifact{
+					ArtifactID: newID("art"),
+					Name:       artName,
+					Parts: []Part{
+						{
+							Filename:  f.Filename,
+							MediaType: f.MediaType,
+							Raw:       f.Raw,
+							URL:       f.URL,
+						},
+					},
+				})
+			}
+			t.Artifacts = append(t.Artifacts, newArtifacts...)
+
 			if err := db.saveLocked(tasks); err != nil {
 				return nil, err
 			}
 			return cloneTask(t), nil
 		}
 	}
-	return nil, fmt.Errorf("%w: %s", ErrTaskNotFound, taskID)
+	return nil, fmt.Errorf("%w: %s", ErrTaskNotFound, req.TaskID)
+}
+
+// ReplyTask records an operator/worker reply artifact on a task and updates its state.
+func (db *DBBackend) ReplyTask(ctx context.Context, taskID, replyText, newState string) (*Task, error) {
+	return db.RespondTask(ctx, RespondRequest{
+		TaskID: taskID,
+		Text:   replyText,
+		State:  newState,
+	})
 }
 
 // CancelTask transitions a task to TASK_STATE_CANCELED.

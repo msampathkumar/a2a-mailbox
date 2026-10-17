@@ -83,13 +83,21 @@ func (p *PubSubBackend) ListTasks(ctx context.Context, contextID, status string)
 	return p.db.ListTasks(ctx, contextID, status)
 }
 
-func (p *PubSubBackend) ReplyTask(ctx context.Context, taskID, replyText, newState string) (*Task, error) {
-	task, err := p.db.ReplyTask(ctx, taskID, replyText, newState)
+func (p *PubSubBackend) RespondTask(ctx context.Context, req RespondRequest) (*Task, error) {
+	task, err := p.db.RespondTask(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	_, _ = p.publishEvent(ctx, "a2a.mailbox.task_replied", task, replyText)
+	_, _ = p.publishEvent(ctx, "a2a.mailbox.task_replied", task, req.Text)
 	return task, nil
+}
+
+func (p *PubSubBackend) ReplyTask(ctx context.Context, taskID, replyText, newState string) (*Task, error) {
+	return p.RespondTask(ctx, RespondRequest{
+		TaskID: taskID,
+		Text:   replyText,
+		State:  newState,
+	})
 }
 
 func (p *PubSubBackend) CancelTask(ctx context.Context, taskID string) (*Task, error) {

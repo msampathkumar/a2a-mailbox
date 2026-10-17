@@ -115,3 +115,67 @@ func TestHandler_AgentCard_SendMessage_GetTask_ListTasks_CancelTask(t *testing.T
 		t.Fatalf("canceledTask.Status.State = %q, want TASK_STATE_CANCELED", canceledTask.Status.State)
 	}
 }
+
+func TestHandler_ResponderEndpoints_Claim_Clarify_And_ReplyWithFiles(t *testing.T) {
+	t.Parallel()
+
+	db, err := store.NewDBBackend(filepath.Join(t.TempDir(), "mailbox.json"), "TASK_STATE_SUBMITTED")
+	if err != nil {
+		t.Fatalf("NewDBBackend() error = %v", err)
+	}
+
+	srv := httptest.NewServer(server.NewHandler(server.Config{
+		Name:    "Responder Mailbox",
+		Version: "0.1.0",
+		Backend: db,
+	}))
+	t.Cleanup(srv.Close)
+
+	// 1. Requester sends task
+	sendResp, err := http.Post(srv.URL+"/message:send", "application/json",
+		bytes.NewReader([]byte(`{"message":{"messageId":"m10","role":"ROLE_USER","parts":[{"text":"Generate architecture diagram"}]}}`)))
+	if err != nil || sendResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /message:send status = %v, err = %v", sendResp, err)
+	}
+	var env struct {
+		Task store.Task `json:"task"`
+	}
+	_ = json.NewDecoder(sendResp.Body).Decode(&env)
+	_ = sendResp.Body.Close()
+	taskID := env.Task.ID
+
+	// 2. Responder claims task via POST /tasks/{id}:claim
+	claimResp, err := http.Post(srv.URL+"/tasks/"+taskID+":claim", "application/json",
+		bytes.NewReader([]byte(`{"workerId":"worker-diagram-01","text":"Claimed diagram task"}`)))
+	if err != nil || claimResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /tasks/{id}:claim status = %v, err = %v", claimResp, err)
+	}
+	var claimed store.Task
+	_ = json.NewDecoder(claimResp.Body).Decode(&claimed)
+	_ = claimResp.Body.Close()
+	if claimed.Status.State != "TASK_STATE_WORKING" {
+		t.Fatalf("claimed state = %q, want TASK_STATE_WORKING", claimed.Status.State)
+	}
+
+	// 3. Responder replies with file attachment via POST /tasks/{id}:reply
+	replyBody := `{"state":"completed","workerId":"worker-diagram-01","text":"Diagram generated.","files":[{"filename":"arch.mmd","mediaType":"text/plain","raw":"Zmxvd2NoYXJ0IExSCiAgQSAtLT4gQg=="}]}`
+	replyResp, err := http.Post(srv.URL+"/tasks/"+taskID+":reply", "application/json", bytes.NewReader([]byte(replyBody)))
+	if err != nil || replyResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /tasks/{id}:reply status = %v, err = %v", replyResp, err)
+	}
+	var completed store.Task
+	_ = json.NewDecoder(replyResp.Body).Decode(&completed)
+	_ = replyResp.Body.Close()
+	if completed.Status.State != "TASK_STATE_COMPLETED" {
+		t.Fatalf("completed state = %q, want TASK_STATE_COMPLETED", completed.Status.State)
+	}
+	foundFile := false
+	for _, a := range completed.Artifacts {
+		if a.Name == "arch.mmd" {
+			foundFile = true
+		}
+	}
+	if !foundFile {
+		t.Fatalf("expected arch.mmd artifact, got %+v", completed.Artifacts)
+	}
+}
