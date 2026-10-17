@@ -1,0 +1,187 @@
+package store_test
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/msampathkumar/a2a-mailbox/internal/store"
+)
+
+func TestDBBackend_RegisterContinueReplyAndList(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "mailbox.json")
+	db, err := store.NewDBBackend(dbPath, "TASK_STATE_INPUT_REQUIRED")
+	if err != nil {
+		t.Fatalf("NewDBBackend() error = %v", err)
+	}
+
+	// 1. Register new incoming request -> assigns taskID and contextID
+	t1, err := db.RegisterMessage(context.Background(), store.IncomingMessage{
+		MessageID: "msg-1",
+		Text:      "Please provision a staging cluster",
+	})
+	if err != nil {
+		t.Fatalf("RegisterMessage(1) error = %v", err)
+	}
+	if t1.ID == "" || t1.ContextID == "" {
+		t.Fatalf("t1 IDs = (%q, %q), want non-empty", t1.ID, t1.ContextID)
+	}
+	if t1.Status.State != "TASK_STATE_INPUT_REQUIRED" {
+		t.Fatalf("t1.Status.State = %q, want TASK_STATE_INPUT_REQUIRED", t1.Status.State)
+	}
+
+	// 2. Continue the same task -> appends to History
+	t2, err := db.RegisterMessage(context.Background(), store.IncomingMessage{
+		MessageID: "msg-2",
+		TaskID:    t1.ID,
+		ContextID: t1.ContextID,
+		Text:      "Region: ap-northeast-1",
+	})
+	if err != nil {
+		t.Fatalf("RegisterMessage(2) error = %v", err)
+	}
+	if t2.ID != t1.ID || len(t2.History) != 2 {
+		t.Fatalf("t2 = %+v, want same ID and 2 history messages", t2)
+	}
+
+	// 3. Operator replies and completes the task
+	completed, err := db.ReplyTask(context.Background(), t1.ID, "Cluster staged in ap-northeast-1", "TASK_STATE_COMPLETED")
+	if err != nil {
+		t.Fatalf("ReplyTask() error = %v", err)
+	}
+	if completed.Status.State != "TASK_STATE_COMPLETED" {
+		t.Fatalf("completed.Status.State = %q, want TASK_STATE_COMPLETED", completed.Status.State)
+	}
+
+	// 4. Attempting to reuse a completed taskID must fail per A2A protocol rules
+	if _, err := db.RegisterMessage(context.Background(), store.IncomingMessage{
+		MessageID: "msg-3",
+		TaskID:    t1.ID,
+		ContextID: t1.ContextID,
+		Text:      "Can I reopen this completed task?",
+	}); err == nil {
+		t.Fatal("RegisterMessage on completed taskID succeeded, want error")
+	}
+
+	// 5. Starting a new task under the same ContextID succeeds!
+	t3, err := db.RegisterMessage(context.Background(), store.IncomingMessage{
+		MessageID: "msg-4",
+		ContextID: t1.ContextID,
+		Text:      "Now configure DNS for the cluster",
+	})
+	if err != nil {
+		t.Fatalf("RegisterMessage(new task in same context) error = %v", err)
+	}
+	if t3.ID == t1.ID || t3.ContextID != t1.ContextID {
+		t.Fatalf("t3 = %+v, want new task ID in same context %q", t3, t1.ContextID)
+	}
+
+	list, err := db.ListTasks(context.Background(), t1.ContextID, "")
+	if err != nil || len(list) != 2 {
+		t.Fatalf("ListTasks() = %+v, err = %v; want 2 tasks", list, err)
+	}
+}
+
+func TestTKBackend_CreatesTicketAndSyncsStatus(t *testing.T) {
+	t.Parallel()
+
+	tkPath, err := exec.LookPath("tk")
+	if err != nil {
+		t.Skip("skipping TKBackend test: tk binary not on PATH")
+	}
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "mailbox.json")
+	db, err := store.NewDBBackend(dbPath, "TASK_STATE_INPUT_REQUIRED")
+	if err != nil {
+		t.Fatalf("NewDBBackend() error = %v", err)
+	}
+
+	tkBackend, err := store.NewTKBackend(db, tkPath, tmpDir)
+	if err != nil {
+		t.Fatalf("NewTKBackend() error = %v", err)
+	}
+
+	// Register a task -> creates a ticket in `.tickets/`
+	task, err := tkBackend.RegisterMessage(context.Background(), store.IncomingMessage{
+		MessageID: "msg-tk-1",
+		Text:      "Audit warehouse robotics firmware",
+	})
+	if err != nil {
+		t.Fatalf("tkBackend.RegisterMessage() error = %v", err)
+	}
+	ticketID, _ := task.Metadata["tkTicketId"].(string)
+	if strings.TrimSpace(ticketID) == "" {
+		t.Fatalf("task.Metadata[tkTicketId] is empty: %+v", task.Metadata)
+	}
+
+	// Simulate an external worker or human closing the ticket directly with `tk close <ticketID>`!
+	cmd := exec.Command(tkPath, "close", ticketID)
+	cmd.Dir = tmpDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("tk close %s error = %v: %s", ticketID, err, string(out))
+	}
+
+	// Now GetTask should sync with `tk` and report TASK_STATE_COMPLETED!
+	updated, err := tkBackend.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatalf("tkBackend.GetTask() error = %v", err)
+	}
+	if updated.Status.State != "TASK_STATE_COMPLETED" {
+		t.Fatalf("updated.Status.State after tk close = %q, want TASK_STATE_COMPLETED", updated.Status.State)
+	}
+}
+
+func TestPubSubBackend_PublishesEventEnvelope(t *testing.T) {
+	t.Parallel()
+
+	var publishedData []byte
+	var publishedAttrs map[string]string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []struct {
+				Data       string            `json:"data"`
+				Attributes map[string]string `json:"attributes"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Messages) == 0 {
+			http.Error(w, "bad pubsub request", http.StatusBadRequest)
+			return
+		}
+		publishedData, _ = base64.StdEncoding.DecodeString(body.Messages[0].Data)
+		publishedAttrs = body.Messages[0].Attributes
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"messageIds": ["pubsub-msg-1001"]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	dbPath := filepath.Join(t.TempDir(), "mailbox.json")
+	db, _ := store.NewDBBackend(dbPath, "TASK_STATE_INPUT_REQUIRED")
+	ps, err := store.NewPubSubBackend(db, srv.URL, "demo-project", "a2a-mailbox-topic", "")
+	if err != nil {
+		t.Fatalf("NewPubSubBackend() error = %v", err)
+	}
+
+	task, err := ps.RegisterMessage(context.Background(), store.IncomingMessage{
+		MessageID: "msg-ps-1",
+		Text:      "Process batch invoice #901",
+	})
+	if err != nil {
+		t.Fatalf("ps.RegisterMessage() error = %v", err)
+	}
+	if publishedAttrs["taskId"] != task.ID || publishedAttrs["contextId"] != task.ContextID {
+		t.Fatalf("publishedAttrs = %+v, want taskId=%s and contextId=%s", publishedAttrs, task.ID, task.ContextID)
+	}
+	if !strings.Contains(string(publishedData), "Process batch invoice #901") {
+		t.Fatalf("publishedData = %s, want message text", string(publishedData))
+	}
+}

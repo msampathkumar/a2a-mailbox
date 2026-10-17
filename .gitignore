@@ -1,0 +1,6 @@
+a2a-mailbox
+*.test
+*.out
+.DS_Store
+.tickets/
+mailbox.json
