@@ -45,6 +45,26 @@ def main() -> int:
 
     history = task_obj.get("history") or []
     turn_count = len(history) if history else 1
+    metadata = task_obj.get("metadata") or {}
+    record_kind = metadata.get("kind") or "message"
+
+    # Extract attached file parts from the incoming message / history
+    attached_files = []
+    for msg in history:
+        for p in (msg.get("parts") or []):
+            fname = p.get("filename") or ""
+            mtype = p.get("mediaType") or "application/octet-stream"
+            raw_b64 = p.get("raw") or ""
+            url = p.get("url") or ""
+            if raw_b64:
+                try:
+                    byte_len = len(base64.b64decode(raw_b64))
+                except Exception:
+                    byte_len = len(raw_b64)
+                attached_files.append(f"{fname or 'inline-file'} ({mtype}, {byte_len} bytes)")
+            elif url:
+                attached_files.append(f"{fname or url} ({url})")
+
     words = len(text.split())
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
 
@@ -55,13 +75,19 @@ def main() -> int:
         "├────────────────────────────────────────────────────────────────────┤",
         f"│ Timestamp (UTC) : {now_utc:<48} │",
         f"│ Trigger Event   : {event:<48} │",
+        f"│ Record Kind     : {record_kind + ' -> promoted to task':<48} │",
         f"│ Task ID         : {task_id:<48} │",
         f"│ Context ID      : {ctx_id:<48} │",
         f"│ Conversation #  : Turn {turn_count:<43} │",
         f"│ Word Count      : {words:<48} │",
+        f"│ Attached Files  : {len(attached_files):<48} │",
+    ]
+    for fdesc in attached_files:
+        report_lines.append(f"│   📎 {fdesc:<61} │")
+    report_lines.extend([
         "├────────────────────────────────────────────────────────────────────┤",
         "│ Message Content :                                                  │",
-    ]
+    ])
     for line in (text.splitlines() or ["(empty)"]):
         report_lines.append(f"│   {line:<64} │")
     report_lines.extend([

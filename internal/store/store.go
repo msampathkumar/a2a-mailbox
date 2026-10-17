@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -172,9 +173,23 @@ func (db *DBBackend) RegisterMessage(_ context.Context, in IncomingMessage) (*Ta
 					Parts:     userParts,
 				}
 				t.History = append(t.History, userMsg)
+				for _, p := range userParts {
+					if strings.TrimSpace(p.Raw) != "" || strings.TrimSpace(p.URL) != "" {
+						artName := strings.TrimSpace(p.Filename)
+						if artName == "" {
+							artName = "incoming-file"
+						}
+						t.Artifacts = append(t.Artifacts, Artifact{
+							ArtifactID: newID("art"),
+							Name:       artName,
+							Parts:      []Part{p},
+						})
+					}
+				}
 				if t.Metadata == nil {
 					t.Metadata = make(map[string]any)
 				}
+				t.Metadata["kind"] = "task"
 				t.Metadata["awaitingWorker"] = true
 				ackText := fmt.Sprintf("Mailbox recorded follow-up message (#%d) for task %s in context %s", len(t.History), t.ID, t.ContextID)
 				t.Status = TaskStatus{
@@ -211,6 +226,29 @@ func (db *DBBackend) RegisterMessage(_ context.Context, in IncomingMessage) (*Ta
 		Parts:     userParts,
 	}
 	ackText := fmt.Sprintf("Queued in A2A Mailbox (task=%s, context=%s)", taskID, ctxID)
+	artifacts := []Artifact{
+		{
+			ArtifactID: newID("art"),
+			Name:       "mailbox-receipt",
+			Parts:      []Part{{Text: ackText}},
+		},
+	}
+	var incomingFileNames []string
+	for _, p := range userParts {
+		if strings.TrimSpace(p.Raw) != "" || strings.TrimSpace(p.URL) != "" {
+			artName := strings.TrimSpace(p.Filename)
+			if artName == "" {
+				artName = "incoming-file"
+			}
+			incomingFileNames = append(incomingFileNames, artName)
+			artifacts = append(artifacts, Artifact{
+				ArtifactID: newID("art"),
+				Name:       artName,
+				Parts:      []Part{p},
+			})
+		}
+	}
+
 	task := &Task{
 		ID:        taskID,
 		ContextID: ctxID,
@@ -225,18 +263,16 @@ func (db *DBBackend) RegisterMessage(_ context.Context, in IncomingMessage) (*Ta
 				Parts:     []Part{{Text: ackText}},
 			},
 		},
-		Artifacts: []Artifact{
-			{
-				ArtifactID: newID("art"),
-				Name:       "mailbox-receipt",
-				Parts:      []Part{{Text: ackText}},
-			},
-		},
-		History: []Message{userMsg},
+		Artifacts: artifacts,
+		History:   []Message{userMsg},
 		Metadata: map[string]any{
 			"backend":        "db",
+			"kind":           "message",
 			"awaitingWorker": true,
 		},
+	}
+	if len(incomingFileNames) > 0 {
+		task.Metadata["incomingFiles"] = incomingFileNames
 	}
 	for k, v := range in.Metadata {
 		task.Metadata[k] = v
@@ -386,6 +422,7 @@ func (db *DBBackend) RespondTask(_ context.Context, req RespondRequest) (*Task, 
 			if t.Metadata == nil {
 				t.Metadata = make(map[string]any)
 			}
+			t.Metadata["kind"] = "task"
 			if strings.TrimSpace(req.WorkerID) != "" {
 				t.Metadata["workerId"] = strings.TrimSpace(req.WorkerID)
 			}
@@ -527,4 +564,71 @@ func IsTerminalProtocolState(s string) bool {
 	default:
 		return false
 	}
+}
+
+// SaveTaskFiles extracts all inline base64 file parts from a task's history and artifacts into destDir.
+func SaveTaskFiles(task *Task, destDir string) ([]string, error) {
+	if task == nil {
+		return nil, errors.New("task is nil")
+	}
+	if strings.TrimSpace(destDir) == "" {
+		return nil, errors.New("destination directory is required")
+	}
+	absDir, err := filepath.Abs(destDir)
+	if err != nil {
+		return nil, err
+	}
+	cleanDir := filepath.Clean(absDir)
+	if err := os.MkdirAll(cleanDir, 0o700); err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]bool)
+	var saved []string
+
+	savePart := func(p Part, idx int) error {
+		if strings.TrimSpace(p.Raw) == "" {
+			return nil
+		}
+		name := filepath.Base(strings.TrimSpace(p.Filename))
+		if name == "" || name == "." || name == ".." {
+			name = fmt.Sprintf("part-%d.bin", idx)
+		}
+		if seen[name] {
+			return nil
+		}
+		target := filepath.Clean(filepath.Join(cleanDir, name))
+		if !strings.HasPrefix(target, cleanDir+string(filepath.Separator)) {
+			return fmt.Errorf("invalid attachment filename %q", p.Filename)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(p.Raw)
+		if err != nil {
+			return fmt.Errorf("decoding base64 file %q: %w", name, err)
+		}
+		if err := os.WriteFile(target, decoded, 0o600); err != nil {
+			return err
+		}
+		seen[name] = true
+		saved = append(saved, target)
+		return nil
+	}
+
+	idx := 0
+	for _, msg := range task.History {
+		for _, p := range msg.Parts {
+			idx++
+			if err := savePart(p, idx); err != nil {
+				return saved, err
+			}
+		}
+	}
+	for _, art := range task.Artifacts {
+		for _, p := range art.Parts {
+			idx++
+			if err := savePart(p, idx); err != nil {
+				return saved, err
+			}
+		}
+	}
+	return saved, nil
 }

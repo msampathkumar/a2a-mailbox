@@ -14,11 +14,12 @@ const maxBodyBytes = 4 << 20 // 4 MiB
 
 // Config configures the executor-less A2A Mailbox HTTP server.
 type Config struct {
-	Name        string
-	Description string
-	Version     string
-	BaseURL     string
-	Backend     store.Backend
+	Name         string
+	Description  string
+	Version      string
+	BaseURL      string
+	ResponseMode string // "task" (default) or "message"
+	Backend      store.Backend
 }
 
 // NewHandler builds an A2A v1.0 HTTP+JSON compliant handler backed by cfg.Backend.
@@ -77,8 +78,8 @@ func (h *handler) handleAgentCard(w http.ResponseWriter, r *http.Request) {
 		"capabilities": map[string]any{
 			"streaming": false,
 		},
-		"defaultInputModes":  []string{"text/plain"},
-		"defaultOutputModes": []string{"text/plain"},
+		"defaultInputModes":  []string{"text/plain", "text/markdown", "application/json", "application/pdf", "application/octet-stream", "image/png", "image/jpeg"},
+		"defaultOutputModes": []string{"text/plain", "text/markdown", "application/json", "application/pdf", "application/octet-stream", "image/png", "image/jpeg"},
 		"skills": []map[string]any{
 			{
 				"id":          "mailbox_inbox",
@@ -145,6 +146,17 @@ func (h *handler) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusBadRequest
 		}
 		writeError(w, status, err.Error())
+		return
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("mode")))
+	if mode == "" {
+		mode = strings.ToLower(strings.TrimSpace(h.cfg.ResponseMode))
+	}
+	if mode == "message" && task.Status.Message != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"message": task.Status.Message,
+		})
 		return
 	}
 
@@ -215,19 +227,28 @@ func (h *handler) handleTaskAction(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, task)
 
-	case "claim":
+	case "claim", "promote":
 		body, _ := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
 		var payload struct {
 			WorkerID string `json:"workerId"`
 			Text     string `json:"text"`
+			State    string `json:"state"`
 		}
 		_ = json.Unmarshal(body, &payload)
 		if strings.TrimSpace(payload.Text) == "" {
-			payload.Text = "Task claimed by responder"
+			if action == "promote" {
+				payload.Text = "Simple message promoted to active task"
+			} else {
+				payload.Text = "Task claimed by responder"
+			}
+		}
+		targetState := "TASK_STATE_WORKING"
+		if strings.TrimSpace(payload.State) != "" {
+			targetState = payload.State
 		}
 		task, err := h.cfg.Backend.RespondTask(r.Context(), store.RespondRequest{
 			TaskID:   taskID,
-			State:    "TASK_STATE_WORKING",
+			State:    targetState,
 			WorkerID: payload.WorkerID,
 			Text:     payload.Text,
 		})

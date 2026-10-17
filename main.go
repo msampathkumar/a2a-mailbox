@@ -115,7 +115,7 @@ func run(ctx context.Context, args []string, out io.Writer, errOut io.Writer) in
 			return runList(ctx, args[1:], out, errOut)
 		case "show":
 			return runShow(ctx, args[1:], out, errOut)
-		case "claim":
+		case "claim", "promote":
 			return runClaim(ctx, args[1:], out, errOut)
 		case "reply", "update":
 			return runReply(ctx, args[1:], out, errOut)
@@ -266,6 +266,7 @@ func runServe(ctx context.Context, args []string, out io.Writer, errOut io.Write
 	pubsubProject := fs.String("pubsub-project", os.Getenv("GOOGLE_CLOUD_PROJECT"), "Google Cloud project ID for Pub/Sub")
 	pubsubTopic := fs.String("pubsub-topic", "a2a-mailbox", "Google Cloud Pub/Sub topic ID")
 	ackState := fs.String("ack-state", "", "Initial A2A task state on message registration")
+	responseMode := fs.String("response-mode", "", "Response envelope mode: task (default) or message")
 	name := fs.String("name", "", "Agent Card name")
 	desc := fs.String("description", "Executor-less A2A inbox server that registers and stores incoming tasks", "Agent Card description")
 
@@ -287,6 +288,7 @@ func runServe(ctx context.Context, args []string, out io.Writer, errOut io.Write
 		}
 	}
 	resolvedAck := resolveVal(*ackState, "A2A_MAILBOX_ACK_STATE", dotEnv, "input-required")
+	resolvedMode := resolveVal(*responseMode, "A2A_MAILBOX_RESPONSE_MODE", dotEnv, "task")
 	resolvedName := resolveVal(*name, "A2A_MAILBOX_NAME", dotEnv, "A2A Mailbox")
 
 	b, err := openConfiguredBackend(
@@ -307,11 +309,12 @@ func runServe(ctx context.Context, args []string, out io.Writer, errOut io.Write
 	addr := fmt.Sprintf("%s:%d", resolvedHost, resolvedPort)
 	baseURL := fmt.Sprintf("http://%s", addr)
 	handler := server.NewHandler(server.Config{
-		Name:        resolvedName,
-		Description: *desc,
-		Version:     version,
-		BaseURL:     baseURL,
-		Backend:     b,
+		Name:         resolvedName,
+		Description:  *desc,
+		Version:      version,
+		BaseURL:      baseURL,
+		ResponseMode: resolvedMode,
+		Backend:      b,
 	})
 
 	srv := &http.Server{
@@ -382,11 +385,15 @@ func runList(ctx context.Context, args []string, out io.Writer, errOut io.Writer
 		if len(t.History) > 0 && len(t.History[len(t.History)-1].Parts) > 0 {
 			lastText = t.History[len(t.History)-1].Parts[0].Text
 		}
+		kind, _ := t.Metadata["kind"].(string)
+		if kind == "" {
+			kind = "task"
+		}
 		ticketInfo := ""
 		if tid, ok := t.Metadata["tkTicketId"].(string); ok && tid != "" {
 			ticketInfo = fmt.Sprintf("  [ticket: %s]", tid)
 		}
-		fmt.Fprintf(out, "%s  context=%s  state=%s%s  %q\n", t.ID, t.ContextID, t.Status.State, ticketInfo, lastText)
+		fmt.Fprintf(out, "%s  kind=%s  context=%s  state=%s%s  %q\n", t.ID, kind, t.ContextID, t.Status.State, ticketInfo, lastText)
 	}
 	return 0
 }
@@ -395,6 +402,7 @@ func runShow(ctx context.Context, args []string, out io.Writer, errOut io.Writer
 	fs := flag.NewFlagSet("a2a-mailbox show", flag.ContinueOnError)
 	fs.SetOutput(errOut)
 	cf := registerCommonFlags(fs)
+	saveFilesDir := fs.String("save-files", "", "Optional directory to extract attached file parts into")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -416,6 +424,17 @@ func runShow(ctx context.Context, args []string, out io.Writer, errOut io.Writer
 	if err != nil {
 		fmt.Fprintf(errOut, "Error: %v\n", err)
 		return 1
+	}
+
+	if strings.TrimSpace(*saveFilesDir) != "" {
+		saved, err := store.SaveTaskFiles(task, *saveFilesDir)
+		if err != nil {
+			fmt.Fprintf(errOut, "Error saving file parts: %v\n", err)
+			return 1
+		}
+		for _, p := range saved {
+			fmt.Fprintf(errOut, "Saved file part: %s\n", p)
+		}
 	}
 
 	data, _ := json.MarshalIndent(task, "", "  ")

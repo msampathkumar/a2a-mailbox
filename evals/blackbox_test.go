@@ -271,8 +271,8 @@ A2A_HOOK_AFTER_ARRIVE="python3 %s"
 		t.Fatalf("server did not become ready on %s\nstderr: %s", baseURL, srvStderr.String())
 	}
 
-	// Send an incoming mail to the mailbox
-	payload := `{"message":{"messageId":"msg-py-demo-1","role":"ROLE_USER","parts":[{"text":"Generate executive summary for Q4 AI agent adoption across 8 teams"}]}}`
+	// Send an incoming mail with BOTH a text part and an inline file part (`q4-metrics.csv`)
+	payload := `{"message":{"messageId":"msg-py-demo-1","role":"ROLE_USER","parts":[{"text":"Generate executive summary for Q4 AI agent adoption across 8 teams"},{"filename":"q4-metrics.csv","mediaType":"text/csv","raw":"dGVhbSxhZG9wdGlvbgphbHBoYSw5OCUK"}]}}`
 	resp, err := http.Post(baseURL+"/message:send", "application/json", strings.NewReader(payload))
 	if err != nil {
 		t.Fatalf("POST /message:send failed: %v", err)
@@ -285,11 +285,13 @@ A2A_HOOK_AFTER_ARRIVE="python3 %s"
 		t.Fatalf("expected TASK_STATE_COMPLETED from Python after_arrive hook, got:\n%s", string(respBody))
 	}
 
-	// 2. Verify the server's STDOUT printed the formatted Python report box!
+	// 2. Verify the server's STDOUT printed the formatted Python report box including the attached file part!
 	stdoutStr := srvStdout.String()
 	for _, want := range []string{
 		"📬 A2A-MAILBOX INCOMING MAIL REPORT",
 		"Trigger Event   : after_arrive",
+		"Record Kind     : message -> promoted to task",
+		"📎 q4-metrics.csv (text/csv, 24 bytes)",
 		"Generate executive summary for Q4 AI agent adoption",
 		"Action Taken    : Report printed to STDOUT & Task COMPLETED",
 	} {

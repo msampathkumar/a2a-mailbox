@@ -299,3 +299,61 @@ func TestResponder_Claim_Clarify_FileAttachments_And_Complete(t *testing.T) {
 		t.Fatalf("expected q3-compliance-report.md artifact on completed task, got %+v", tDone.Artifacts)
 	}
 }
+
+func TestSimpleMessageWithFileParts_PromotesToTask_AndSavesFiles(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "mailbox.json")
+	db, err := store.NewDBBackend(dbPath, "TASK_STATE_INPUT_REQUIRED")
+	if err != nil {
+		t.Fatalf("NewDBBackend() error = %v", err)
+	}
+
+	csvData := "id,amount\n101,450.00\n102,890.50\n"
+	csvB64 := base64.StdEncoding.EncodeToString([]byte(csvData))
+
+	// 1. Incoming request is a simple message with both a text part and a file part
+	msgRecord, err := db.RegisterMessage(context.Background(), store.IncomingMessage{
+		MessageID: "msg-simple-1",
+		Text:      "Please reconcile this invoice batch",
+		Parts: []store.Part{
+			{Text: "Please reconcile this invoice batch"},
+			{
+				Filename:  "invoices.csv",
+				MediaType: "text/csv",
+				Raw:       csvB64,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("RegisterMessage() error = %v", err)
+	}
+	if kind, _ := msgRecord.Metadata["kind"].(string); kind != "message" {
+		t.Fatalf("initial Metadata[kind] = %q, want %q", kind, "message")
+	}
+
+	// 2. When a worker claims or responds to the message, it automatically becomes a task (kind="task")
+	promoted, err := db.RespondTask(context.Background(), store.RespondRequest{
+		TaskID:   msgRecord.ID,
+		State:    "TASK_STATE_WORKING",
+		WorkerID: "reconcile-worker",
+		Text:     "Promoted message to active reconciliation task",
+	})
+	if err != nil {
+		t.Fatalf("RespondTask() error = %v", err)
+	}
+	if kind, _ := promoted.Metadata["kind"].(string); kind != "task" {
+		t.Fatalf("promoted Metadata[kind] = %q, want %q", kind, "task")
+	}
+
+	// 3. Save all file parts (from incoming message and artifacts) to a directory
+	outDir := filepath.Join(tmpDir, "extracted")
+	savedPaths, err := store.SaveTaskFiles(promoted, outDir)
+	if err != nil {
+		t.Fatalf("SaveTaskFiles() error = %v", err)
+	}
+	if len(savedPaths) == 0 {
+		t.Fatal("expected SaveTaskFiles to extract invoices.csv, got 0 files")
+	}
+}
